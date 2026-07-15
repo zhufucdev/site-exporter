@@ -3,19 +3,29 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    zig.url = "github:silversquirl/zig-flake";
+    zig.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      zig,
       ...
     }@inputs:
 
     let
       overlay = (
-        final: prev: {
-          site-exporter = final.callPackage (import ./nix/package.nix) { };
+        final: prev:
+        let
+          zigPackages = zig.packages.${final.stdenv.hostPlatform.system};
+        in
+        {
+          inherit zigPackages;
+          site-exporter = final.callPackage (import ./nix/package.nix) {
+            zigPackages = zigPackages.default;
+          };
         }
       );
       supportedSystems = [
@@ -44,7 +54,7 @@
         {
           default = pkgs.mkShellNoCC {
             packages = with pkgs; [
-              zigPackages."0.16"
+              zigPackages.default
               zls
               lldb
             ];

@@ -1,30 +1,23 @@
 {
   lib,
   pkgs,
-  zig,
+  zigPackages,
   stdenv,
 }:
-stdenv.mkDerivation {
+zigPackages.makePackage {
   pname = "site-exporter";
   version = "0.1.0";
 
   src = ../.;
 
-  nativeBuildInputs =
-    with pkgs;
-    [
-      libpq
-      libpq.dev
-      zlib
-      icu
-      openssl
-    ]
-    ++ [ zig.hook ];
+  nativeBuildInputs = with pkgs; [
+    libpq
+    libpq.dev
+    zlib
+    icu
+    openssl
+  ];
 
-  preBuild = ''
-    cp -r ${pkgs.callPackage ./deps.nix { }} $ZIG_GLOBAL_CACHE_DIR/p
-    chmod 744 -R $ZIG_GLOBAL_CACHE_DIR/p
-  '';
-
-  # zigBuildFlags = "--zig-lib-dir ${pkgs.callPackage ./deps.nix { }}";
+  zigReleaseMode = "fast";
+  depsHash = "sha256-niKPok6HvjtlS1QJICsHJU+GvJ5lj9sy28ur1Aob2iA=";
 }
