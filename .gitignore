@@ -1,0 +1,6 @@
+/zig-*
+.zig-cache
+/.direnv
+
+.vscode
+
