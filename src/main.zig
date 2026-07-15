@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const builtin = @import("builtin");
 
@@ -35,8 +36,19 @@ pub fn main(init: std.process.Init) !void {
         _ = debug_allocator.deinit();
     };
 
-    const db_url = init.environ_map.get("DB_URL") orelse std.debug.panic("DB_URL not set", .{});
-    var app_context = try site_exporter.AppContext.init(try init.arena.allocator().dupeSentinel(u8, db_url, 0));
+    var app_context = ac: {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var db_url = get_environ(arena.allocator(), init.io, init.environ_map.get("DB_URL") orelse {
+            std.log.err("DB_URL not set", .{});
+            return;
+        }) catch |err| {
+            std.log.err("Unable to read DB_URL: {}", .{err});
+            return;
+        };
+        db_url = std.mem.trim(u8, db_url, "\n\t ");
+        break :ac try site_exporter.AppContext.init(try arena.allocator().dupeSentinel(u8, db_url, 0));
+    };
     defer app_context.deinit();
 
     const App = zap.App.Create(site_exporter.AppContext);
@@ -55,4 +67,18 @@ pub fn main(init: std.process.Init) !void {
         .threads = 4,
         .workers = 1,
     });
+}
+
+fn get_environ(allocator: Allocator, io: Io, value: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, value, "file:")) {
+        const file = try Io.Dir.cwd().openFile(io, value[5..], .{ .mode = .read_only });
+        defer file.close(io);
+
+        var buffer: [256]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        const file_size = @as(usize, @intCast(try reader.getSize()));
+        const content = try reader.interface.readAlloc(allocator, file_size);
+        return content;
+    }
+    return value;
 }
