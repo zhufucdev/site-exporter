@@ -85,6 +85,7 @@ in
             ++ lib.optional (cfg.port != null) (toString cfg.port)
           );
           Environment = [ "DB_URL=${cfg.dbUrl}" ];
+          DynamicUser = !staticUser;
         };
     };
   };
