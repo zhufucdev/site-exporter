@@ -33,7 +33,10 @@ pub fn main(init: std.process.Init) !void {
         .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
     };
     defer if (is_debug) {
-        _ = debug_allocator.deinit();
+        const check = debug_allocator.deinit();
+        if (check == .leak) {
+            std.log.err("mem leak detected!", .{});
+        }
     };
 
     var app_context = ac: {
@@ -55,7 +58,8 @@ pub fn main(init: std.process.Init) !void {
     try App.init(init.io, gpa, &app_context, .{});
     defer App.deinit();
 
-    var metrics_endpoint = site_exporter.MetricsEndpoint.init(init.io, "/metrics");
+    var metrics_endpoint = site_exporter.MetricsEndpoint.init(gpa, init.io, "/metrics");
+    defer metrics_endpoint.deinit();
     try App.register(&metrics_endpoint);
 
     try App.listen(.{

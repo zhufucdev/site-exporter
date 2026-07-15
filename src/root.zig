@@ -1,6 +1,8 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Mutex = std.Io.Mutex;
+const Io = std.Io;
 
 const m = @import("metrics");
 const zap = @import("zap");
@@ -10,8 +12,16 @@ const pq = @cImport({
 });
 const Metrics = struct {
     page_views: PageViews,
+    up: m.Gauge(u8),
 
     const PageViews = m.GaugeVec(u32, struct { page_id: []const u8 });
+
+    pub fn init(allocator: Allocator, io: Io) !Metrics {
+        return .{
+            .page_views = try PageViews.init(allocator, io, "page_views", .{ .help = "view per article" }, .{}),
+            .up = m.Gauge(u8).init("up", .{ .help = "whether the database is up" }, .{}),
+        };
+    }
 };
 
 pub const DbError = error{
@@ -51,40 +61,65 @@ pub const MetricsEndpoint = struct {
     path: []const u8,
     error_strategy: zap.Endpoint.ErrorStrategy = .log_to_response,
 
+    allocator: Allocator,
     io: std.Io,
     metrics: Metrics,
+    metrics_initialized: bool = false,
+    metrics_mutex: Mutex,
 
-    pub fn init(io: std.Io, path: []const u8) MetricsEndpoint {
+    pub fn init(allocator: Allocator, io: std.Io, path: []const u8) MetricsEndpoint {
         return .{
+            .allocator = allocator,
             .io = io,
             .path = path,
             .metrics = m.initializeNoop(Metrics),
+            .metrics_mutex = Mutex.init,
         };
     }
 
+    pub fn deinit(self: *MetricsEndpoint) void {
+        if (!self.metrics_mutex.tryLock()) {
+            std.log.err("failed to lock metrics, potential mem leak!", .{});
+        } else {
+            defer self.metrics_mutex.unlock(self.io);
+        }
+        if (self.metrics_initialized) {
+            self.metrics.page_views.deinit();
+        }
+    }
+
     pub fn get(self: *MetricsEndpoint, allocator: Allocator, context: *AppContext, request: zap.Request) !void {
-        self.metrics.page_views = try Metrics.PageViews.init(allocator, self.io, "page_views", .{}, .{});
-        defer self.metrics.page_views.deinit();
+        try self.metrics_mutex.lock(self.io);
+        if (!self.metrics_initialized) {
+            self.metrics = try Metrics.init(self.allocator, self.io);
+            self.metrics_initialized = true;
+        }
+        self.metrics_mutex.unlock(self.io);
 
         const db = try get_db(context.db_conninfo);
         const res = pq.PQexec(db,
             \\SELECT "pageId", "views" FROM page_views ORDER BY "pageId";
         );
         defer pq.PQclear(res);
+        defer pq.PQfinish(db);
+
+        var rows: usize = 0;
         if (pq.PQresultStatus(res) != pq.PGRES_TUPLES_OK) {
             std.log.err("failed to get page views: {s}", .{pq.PQresultErrorMessage(res)});
-            return DbError.Query;
+            self.metrics.up.set(0);
+        } else {
+            self.metrics.up.set(1);
+
+            rows = @as(usize, @intCast(pq.PQntuples(res)));
+            var i: i32 = 0;
+            while (i < rows) : (i += 1) {
+                const page_id = std.mem.span(pq.PQgetvalue(res, i, 0));
+                const views = std.mem.span(pq.PQgetvalue(res, i, 1));
+                try self.metrics.page_views.set(.{ .page_id = page_id }, std.fmt.parseInt(u32, views, 10) catch return DbError.Query);
+            }
         }
 
-        const rows = pq.PQntuples(res);
-        var i: i32 = 0;
-        while (i < rows) : (i += 1) {
-            const page_id = std.mem.span(pq.PQgetvalue(res, i, 0));
-            const views = std.mem.span(pq.PQgetvalue(res, i, 1));
-            try self.metrics.page_views.set(.{ .page_id = page_id }, std.fmt.parseInt(u32, views, 10) catch unreachable);
-        }
-
-        var buffer = try std.ArrayList(u8).initCapacity(allocator, @as(usize, @intCast(rows)) * 10);
+        var buffer = try std.ArrayList(u8).initCapacity(allocator, rows * 10);
         var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buffer);
 
         try m.write(&self.metrics, &writer.writer);
