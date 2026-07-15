@@ -88,6 +88,7 @@ pub const MetricsEndpoint = struct {
         var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buffer);
 
         try m.write(&self.metrics, &writer.writer);
+        try writer.writer.print("# EOF\n", .{});
         try request.setHeader("content-type", "application/openmetrics-text; version=1.0.0");
         try request.sendBody(try writer.toOwnedSlice());
     }
