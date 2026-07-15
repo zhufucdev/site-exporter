@@ -20,23 +20,32 @@ pub const DbError = error{
 };
 
 pub const AppContext = struct {
-    db: *pq.PGconn,
+    db_conninfo: [:0]const u8,
+    allocator: Allocator,
 
-    pub fn init(conninfo: [:0]const u8) DbError!AppContext {
-        const db = pq.PQconnectdb(conninfo) orelse unreachable;
-        if (pq.PQstatus(db) != pq.CONNECTION_OK) {
-            std.log.err("app context failed to initailize db connection: {s}", .{std.mem.span(pq.PQerrorMessage(db))});
-            return DbError.Connection;
-        }
+    pub fn init(allocator: Allocator, conninfo: []const u8) !AppContext {
+        const c_conninfo = try allocator.dupeSentinel(u8, conninfo, 0);
+        const db = try get_db(c_conninfo);
+        defer pq.PQfinish(db);
         return .{
-            .db = db,
+            .db_conninfo = c_conninfo,
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *AppContext) void {
-        pq.PQfinish(self.db);
+        self.allocator.free(self.db_conninfo);
     }
 };
+
+pub fn get_db(conninfo: [:0]const u8) DbError!*pq.PGconn {
+    const db = pq.PQconnectdb(conninfo) orelse unreachable;
+    if (pq.PQstatus(db) != pq.CONNECTION_OK) {
+        std.log.err("app context failed to initailize db connection: {s}", .{std.mem.span(pq.PQerrorMessage(db))});
+        return DbError.Connection;
+    }
+    return db;
+}
 
 pub const MetricsEndpoint = struct {
     path: []const u8,
@@ -57,7 +66,8 @@ pub const MetricsEndpoint = struct {
         self.metrics.page_views = try Metrics.PageViews.init(allocator, self.io, "page_views", .{}, .{});
         defer self.metrics.page_views.deinit();
 
-        const res = pq.PQexec(context.db,
+        const db = try get_db(context.db_conninfo);
+        const res = pq.PQexec(db,
             \\SELECT "pageId", "views" FROM page_views ORDER BY "pageId";
         );
         defer pq.PQclear(res);

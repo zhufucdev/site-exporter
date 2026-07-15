@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         db_url = std.mem.trim(u8, db_url, "\n\t ");
-        break :ac try site_exporter.AppContext.init(try arena.allocator().dupeSentinel(u8, db_url, 0));
+        break :ac try site_exporter.AppContext.init(gpa, db_url);
     };
     defer app_context.deinit();
 
