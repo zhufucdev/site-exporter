@@ -6,50 +6,50 @@
   };
 
   outputs =
-    { self, ... }@inputs:
+    {
+      self,
+      nixpkgs,
+      ...
+    }@inputs:
 
     let
-      overlays = [
-        (final: prev: {
-          zigpkgs = inputs.zig.packages.${prev.system};
-        })
-      ];
+      overlay = (
+        final: prev: {
+          site-exporter = final.callPackage (import ./nix/package.nix) { };
+        }
+      );
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forEachSupportedSystem =
-        f:
-        inputs.nixpkgs.lib.genAttrs supportedSystems (
-          system:
-          f {
-            inherit system;
-            pkgs = import inputs.nixpkgs {
-              inherit system overlays;
-            };
-          }
-        );
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      nixpkgsFor = forAllSystems (
+        system:
+        import inputs.nixpkgs {
+          inherit system;
+          overlays = [ overlay ];
+          config = {
+            allowUnsupportedSystem = true;
+          };
+        }
+      );
     in
     {
-      devShells = forEachSupportedSystem (
-        { pkgs, system }:
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgsFor.${system};
+        in
         {
           default = pkgs.mkShellNoCC {
             packages = with pkgs; [
               zigPackages."0.16"
               zls
               lldb
-              self.formatter.${system}
             ];
 
-            nativeBuildInputs = with pkgs; [
-              libpq
-              libpq.dev
-              zlib
-              icu
-              openssl
-            ];
+            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
 
             shellHook = ''
               export LIBRARY_PATH=${pkgs.zlib.out}/lib:${pkgs.icu.out}/lib:${pkgs.openssl.out}/lib:${pkgs.libpq.out}/lib:${pkgs.libpq.dev}/lib:$LIBRARY_PATH
@@ -59,6 +59,13 @@
         }
       );
 
-      formatter = forEachSupportedSystem ({ pkgs, ... }: pkgs.nixfmt);
+      packages = forAllSystems (system: {
+        default = nixpkgsFor.${system}.site-exporter;
+      });
+
+      nixosModules.default = { ... }: {
+        nixpkgs.overlays = [ overlay ];
+        imports = [ ./nix/module.nix ];
+      };
     };
 }
