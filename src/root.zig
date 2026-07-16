@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Mutex = std.Io.Mutex;
 const Io = std.Io;
+const Thread = std.Thread;
 
 const m = @import("metrics");
 const zap = @import("zap");
@@ -24,38 +25,150 @@ const Metrics = struct {
     }
 };
 
+const PGconnMutexGuard = struct {
+    db: *pq.PGconn,
+    mutex: *Mutex,
+
+    fn init(db: *pq.PGconn, mutex: *Mutex) PGconnMutexGuard {
+        return .{
+            .db = db,
+            .mutex = mutex,
+        };
+    }
+
+    fn deinit(self: *PGconnMutexGuard, io: Io) !void {
+        defer self.mutex.unlock(io);
+    }
+};
+
+const ExpirationTask = struct {
+    allocator: Allocator,
+    io: Io,
+    db: *pq.PGconn,
+    mutex: *Mutex,
+    timeout: Io.Duration,
+    canceled: bool = false,
+    thread: ?Thread,
+
+    fn init(allocator: Allocator, io: Io, db: *pq.PGconn, mutex: *Mutex, timeout: Io.Duration) Allocator.Error!*ExpirationTask {
+        var s = try allocator.create(ExpirationTask);
+        s.allocator = allocator;
+        s.io = io;
+        s.db = db;
+        s.mutex = mutex;
+        s.timeout = timeout;
+        s.thread = null;
+        return s;
+    }
+
+    fn deinit(self: *ExpirationTask) void {
+        if (!self.canceled) {
+            pq.PQfinish(self.db);
+        }
+        self.canceled = true;
+        if (self.thread) |t| {
+            t.join();
+        }
+    }
+
+    fn start(self: *ExpirationTask) Thread.SpawnError!void {
+        if (self.thread != null) {
+            return Thread.SpawnError.Unexpected;
+        }
+        self.canceled = false;
+        const t = try Thread.spawn(.{}, tickExpiration, .{self});
+        self.thread = t;
+    }
+
+    fn cancel(self: *ExpirationTask) void {
+        self.canceled = true;
+        if (self.thread) |thread| {
+            thread.detach();
+        }
+        self.thread = null;
+    }
+};
+
+/// Note: polling based, 1 second interval
+fn tickExpiration(self: *ExpirationTask) !void {
+    defer self.allocator.destroy(self);
+    const interval_ns = 1_000_000_000;
+    while (!self.canceled and self.timeout.nanoseconds > 0) {
+        const real_interval = @min(interval_ns, self.timeout.nanoseconds);
+        Io.sleep(self.io, Io.Duration.fromNanoseconds(real_interval), .awake) catch {
+            std.log.warn("expiration task canceled", .{});
+            return;
+        };
+        self.timeout.nanoseconds -= interval_ns;
+    }
+    if (self.canceled) {
+        return;
+    }
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+
+    pq.PQfinish(self.db);
+}
+
 pub const DbError = error{
     Connection,
     Query,
 };
 
 pub const AppContext = struct {
-    db_conninfo: [:0]const u8,
     allocator: Allocator,
+    db_conninfo: [:0]const u8,
+    conn_expiration_timeout: Io.Duration,
+    db: ?*pq.PGconn = null,
+    db_mutex: Mutex = .init,
+    expiration_task: ?*ExpirationTask = null,
 
-    pub fn init(allocator: Allocator, conninfo: []const u8) !AppContext {
+    pub fn init(allocator: Allocator, conninfo: []const u8, conn_expiration: Io.Duration) !AppContext {
         const c_conninfo = try allocator.dupeSentinel(u8, conninfo, 0);
-        const db = try get_db(c_conninfo);
-        defer pq.PQfinish(db);
         return .{
-            .db_conninfo = c_conninfo,
             .allocator = allocator,
+            .db_conninfo = c_conninfo,
+            .conn_expiration_timeout = conn_expiration,
         };
     }
 
     pub fn deinit(self: *AppContext) void {
+        if (self.expiration_task) |task| {
+            task.deinit();
+        }
         self.allocator.free(self.db_conninfo);
     }
-};
 
-pub fn get_db(conninfo: [:0]const u8) DbError!*pq.PGconn {
-    const db = pq.PQconnectdb(conninfo) orelse unreachable;
-    if (pq.PQstatus(db) != pq.CONNECTION_OK) {
-        std.log.err("app context failed to initailize db connection: {s}", .{std.mem.span(pq.PQerrorMessage(db))});
-        return DbError.Connection;
+    fn get_dbconn(self: *AppContext, io: Io) !PGconnMutexGuard {
+        try self.db_mutex.lock(io);
+
+        if (self.expiration_task) |task| {
+            task.cancel();
+            self.expiration_task = null;
+        }
+        defer {
+            if (ExpirationTask.init(self.allocator, io, self.db orelse unreachable, &self.db_mutex, self.conn_expiration_timeout)) |task| {
+                task.start() catch |err| std.log.err("failed to start expiration task: {}", .{err});
+                self.expiration_task = task;
+            } else |err| {
+                std.log.err("failed to allocate expiration task: {}", .{err});
+            }
+        }
+
+        if (self.db) |db| {
+            return PGconnMutexGuard.init(db, &self.db_mutex);
+        } else {
+            const db = pq.PQconnectdb(self.db_conninfo) orelse unreachable;
+            if (pq.PQstatus(db) != pq.CONNECTION_OK) {
+                std.log.err("app context failed to initailize db connection: {s}", .{std.mem.span(pq.PQerrorMessage(db))});
+                self.db_mutex.unlock(io);
+                return DbError.Connection;
+            }
+            self.db = db;
+            return PGconnMutexGuard.init(db, &self.db_mutex);
+        }
     }
-    return db;
-}
+};
 
 pub const MetricsEndpoint = struct {
     path: []const u8,
@@ -96,12 +209,11 @@ pub const MetricsEndpoint = struct {
         }
         self.metrics_mutex.unlock(self.io);
 
-        const db = try get_db(context.db_conninfo);
-        const res = pq.PQexec(db,
+        var db_guard = try context.get_dbconn(self.io);
+        const res = pq.PQexec(db_guard.db,
             \\SELECT "pageId", "views" FROM page_views ORDER BY "pageId";
         );
         defer pq.PQclear(res);
-        defer pq.PQfinish(db);
 
         var rows: usize = 0;
         if (pq.PQresultStatus(res) != pq.PGRES_TUPLES_OK) {
@@ -126,5 +238,9 @@ pub const MetricsEndpoint = struct {
         try writer.writer.print("# EOF\n", .{});
         try request.setHeader("content-type", "application/openmetrics-text; version=1.0.0");
         try request.sendBody(try writer.toOwnedSlice());
+
+        db_guard.deinit(self.io) catch |err| {
+            std.log.err("failed to release db connection, potential leaks! {}", .{err});
+        };
     }
 };
