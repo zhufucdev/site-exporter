@@ -41,72 +41,91 @@ const PGconnMutexGuard = struct {
     }
 };
 
-const ExpirationTask = struct {
+const ExpirationTimer = struct {
     allocator: Allocator,
     io: Io,
     db: *pq.PGconn,
-    mutex: *Mutex,
+    db_mutex: *Mutex,
     timeout: Io.Duration,
-    canceled: bool = false,
+    countdown_ns: std.atomic.Value(i128),
+    canceled: bool,
+    expired: bool,
     thread: ?Thread,
 
-    fn init(allocator: Allocator, io: Io, db: *pq.PGconn, mutex: *Mutex, timeout: Io.Duration) Allocator.Error!*ExpirationTask {
-        var s = try allocator.create(ExpirationTask);
+    fn init(allocator: Allocator, io: Io, db: *pq.PGconn, mutex: *Mutex, timeout: Io.Duration) Allocator.Error!*ExpirationTimer {
+        var s = try allocator.create(ExpirationTimer);
         s.allocator = allocator;
         s.io = io;
         s.db = db;
-        s.mutex = mutex;
+        s.db_mutex = mutex;
         s.timeout = timeout;
+        s.countdown_ns = std.atomic.Value(i128).init(timeout.nanoseconds);
+        s.canceled = false;
+        s.expired = false;
         s.thread = null;
         return s;
     }
 
-    fn deinit(self: *ExpirationTask) void {
-        if (!self.canceled) {
+    fn deinit(self: *ExpirationTimer) !void {
+        if (!self.expired) {
+            try self.db_mutex.lock(self.io);
+            self.expired = true;
             pq.PQfinish(self.db);
+            self.db_mutex.unlock(self.io);
         }
+
         self.canceled = true;
         if (self.thread) |t| {
             t.join();
         }
+        self.allocator.destroy(self);
     }
 
-    fn start(self: *ExpirationTask) Thread.SpawnError!void {
+    fn start(self: *ExpirationTimer) Thread.SpawnError!void {
         if (self.thread != null) {
             return Thread.SpawnError.Unexpected;
         }
         self.canceled = false;
-        const t = try Thread.spawn(.{}, tickExpiration, .{self});
-        self.thread = t;
+        self.thread = try Thread.spawn(.{}, tickExpiration, .{self});
     }
 
-    fn cancel(self: *ExpirationTask) void {
+    fn cancel(self: *ExpirationTimer) void {
         self.canceled = true;
         if (self.thread) |thread| {
+            self.thread = null;
             thread.detach();
         }
-        self.thread = null;
+    }
+
+    fn reset(self: *ExpirationTimer) void {
+        self.countdown_ns.store(self.timeout.nanoseconds, .unordered);
     }
 };
 
 /// Note: polling based, 1 second interval
-fn tickExpiration(self: *ExpirationTask) !void {
-    defer self.allocator.destroy(self);
+fn tickExpiration(self: *ExpirationTimer) !void {
     const interval_ns = 1_000_000_000;
-    while (!self.canceled and self.timeout.nanoseconds > 0) {
+    while (!self.canceled) {
+        const countdown = self.countdown_ns.load(.acquire);
+        if (countdown <= 0) {
+            self.countdown_ns.store(0, .release);
+            break;
+        }
         const real_interval = @min(interval_ns, self.timeout.nanoseconds);
         Io.sleep(self.io, Io.Duration.fromNanoseconds(real_interval), .awake) catch {
-            std.log.warn("expiration task canceled", .{});
+            std.log.warn("expiration timer canceled", .{});
             return;
         };
-        self.timeout.nanoseconds -= interval_ns;
+        self.countdown_ns.store(countdown - real_interval, .release);
     }
-    if (self.canceled) {
+    try self.db_mutex.lock(self.io);
+    defer self.db_mutex.unlock(self.io);
+    if (self.canceled or self.expired) {
         return;
     }
-    try self.mutex.lock(self.io);
-    defer self.mutex.unlock(self.io);
 
+    self.thread = null;
+    self.expired = true;
     pq.PQfinish(self.db);
 }
 
@@ -121,7 +140,8 @@ pub const AppContext = struct {
     conn_expiration_timeout: Io.Duration,
     db: ?*pq.PGconn = null,
     db_mutex: Mutex = .init,
-    expiration_task: ?*ExpirationTask = null,
+    expiration_timer: ?*ExpirationTimer = null,
+    timer_mutex: Mutex = .init,
 
     pub fn init(allocator: Allocator, conninfo: []const u8, conn_expiration: Io.Duration) !AppContext {
         const c_conninfo = try allocator.dupeSentinel(u8, conninfo, 0);
@@ -133,8 +153,8 @@ pub const AppContext = struct {
     }
 
     pub fn deinit(self: *AppContext) void {
-        if (self.expiration_task) |task| {
-            task.deinit();
+        if (self.expiration_timer != null) {
+            self.expiration_timer.?.deinit() catch |err| std.log.err("could not deinit expiration timer: {}", .{err});
         }
         self.allocator.free(self.db_conninfo);
     }
@@ -142,20 +162,27 @@ pub const AppContext = struct {
     fn get_dbconn(self: *AppContext, io: Io) !PGconnMutexGuard {
         try self.db_mutex.lock(io);
 
-        if (self.expiration_task) |task| {
-            task.cancel();
-            self.expiration_task = null;
-        }
-        defer {
-            if (self.db) |db| {
-                if (ExpirationTask.init(self.allocator, io, db orelse unreachable, &self.db_mutex, self.conn_expiration_timeout)) |task| {
-                    task.start() catch |err| std.log.err("failed to start expiration task: {}", .{err});
-                    self.expiration_task = task;
-                } else |err| {
-                    std.log.err("failed to allocate expiration task: {}", .{err});
-                }
+        try self.timer_mutex.lock(io);
+        defer self.timer_mutex.unlock(io);
+        if (self.expiration_timer) |timer| {
+            if (timer.expired) {
+                self.db = null;
+                timer.deinit() catch {
+                    std.log.err("failed to deinit expiration timer, potential leaks!", .{});
+                };
+                self.expiration_timer = null;
+            } else {
+                timer.reset();
             }
         }
+        defer if (self.db) |db| {
+            if (self.expiration_timer == null) {
+                if (ExpirationTimer.init(self.allocator, io, db, &self.db_mutex, self.conn_expiration_timeout) catch null) |new_timer| {
+                    new_timer.start() catch |err| std.log.err("failed to start expiration timer: {}", .{err});
+                    self.expiration_timer = new_timer;
+                }
+            }
+        };
 
         if (self.db) |db| {
             return PGconnMutexGuard.init(db, &self.db_mutex);

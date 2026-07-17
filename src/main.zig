@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         db_url = std.mem.trim(u8, db_url, "\n\t ");
-        break :ac try site_exporter.AppContext.init(gpa, db_url, Io.Duration.fromSeconds(3 * std.time.s_per_min));
+        break :ac try site_exporter.AppContext.init(gpa, db_url, Io.Duration.fromSeconds(5 * std.time.s_per_min));
     };
     defer app_context.deinit();
 
