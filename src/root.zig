@@ -47,7 +47,7 @@ const ExpirationTimer = struct {
     db: *pq.PGconn,
     db_mutex: *Mutex,
     timeout: Io.Duration,
-    countdown_ns: std.atomic.Value(i128),
+    countdown_s: std.atomic.Value(i64),
     canceled: bool,
     expired: bool,
     thread: ?Thread,
@@ -59,7 +59,7 @@ const ExpirationTimer = struct {
         s.db = db;
         s.db_mutex = mutex;
         s.timeout = timeout;
-        s.countdown_ns = std.atomic.Value(i128).init(timeout.nanoseconds);
+        s.countdown_s = std.atomic.Value(i64).init(timeout.toSeconds());
         s.canceled = false;
         s.expired = false;
         s.thread = null;
@@ -98,25 +98,25 @@ const ExpirationTimer = struct {
     }
 
     fn reset(self: *ExpirationTimer) void {
-        self.countdown_ns.store(self.timeout.nanoseconds, .unordered);
+        self.countdown_s.store(self.timeout.toSeconds(), .unordered);
     }
 };
 
 /// Note: polling based, 1 second interval
 fn tickExpiration(self: *ExpirationTimer) !void {
-    const interval_ns = 1_000_000_000;
+    const interval_s = 1;
     while (!self.canceled) {
-        const countdown = self.countdown_ns.load(.acquire);
-        if (countdown <= 0) {
-            self.countdown_ns.store(0, .release);
+        const countdown_s = self.countdown_s.load(.acquire);
+        if (countdown_s <= 0) {
+            self.countdown_s.store(0, .release);
             break;
         }
-        const real_interval = @min(interval_ns, self.timeout.nanoseconds);
-        Io.sleep(self.io, Io.Duration.fromNanoseconds(real_interval), .awake) catch {
+        const real_interval_s = @min(interval_s, self.timeout.toSeconds());
+        Io.sleep(self.io, Io.Duration.fromSeconds(real_interval_s), .awake) catch {
             std.log.warn("expiration timer canceled", .{});
             return;
         };
-        self.countdown_ns.store(countdown - real_interval, .release);
+        self.countdown_s.store(countdown_s - real_interval_s, .release);
     }
     try self.db_mutex.lock(self.io);
     defer self.db_mutex.unlock(self.io);
