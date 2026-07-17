@@ -147,11 +147,13 @@ pub const AppContext = struct {
             self.expiration_task = null;
         }
         defer {
-            if (ExpirationTask.init(self.allocator, io, self.db orelse unreachable, &self.db_mutex, self.conn_expiration_timeout)) |task| {
-                task.start() catch |err| std.log.err("failed to start expiration task: {}", .{err});
-                self.expiration_task = task;
-            } else |err| {
-                std.log.err("failed to allocate expiration task: {}", .{err});
+            if (self.db) |db| {
+                if (ExpirationTask.init(self.allocator, io, db orelse unreachable, &self.db_mutex, self.conn_expiration_timeout)) |task| {
+                    task.start() catch |err| std.log.err("failed to start expiration task: {}", .{err});
+                    self.expiration_task = task;
+                } else |err| {
+                    std.log.err("failed to allocate expiration task: {}", .{err});
+                }
             }
         }
 
@@ -161,6 +163,7 @@ pub const AppContext = struct {
             const db = pq.PQconnectdb(self.db_conninfo) orelse unreachable;
             if (pq.PQstatus(db) != pq.CONNECTION_OK) {
                 std.log.err("app context failed to initailize db connection: {s}", .{std.mem.span(pq.PQerrorMessage(db))});
+                pq.PQfinish(db);
                 self.db_mutex.unlock(io);
                 return DbError.Connection;
             }
